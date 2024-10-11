@@ -14,14 +14,14 @@ services:
     deploy:
       resources:
         limits:
-            memory: 8G
+          memory: 8G
         reservations:
-            memory: 4G
-# Add this to pass through 1 GPU
-#            devices:
-#              - driver: nvidia
-#                count: 1
-#                capabilities: [gpu]
+          memory: 4G
+          # GPU configuration
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     environment:
       # specify these parameters if you want to use basic auth for the model server
       - BASIC_AUTH_USER=
