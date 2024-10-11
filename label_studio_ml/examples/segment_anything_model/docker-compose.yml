@@ -4,6 +4,8 @@ services:
   segment_anything_model:
     container_name: segment_anything_model
     image: heartexlabs/label-studio-ml-backend:sam-master
+    networks:
+      - label-studio
     build:
       context: .
       shm_size: '4gb'
@@ -15,7 +17,7 @@ services:
             memory: 8G
         reservations:
             memory: 4G
-# Add this to pass through 1 GPU 
+# Add this to pass through 1 GPU
 #            devices:
 #              - driver: nvidia
 #                count: 1
@@ -47,3 +49,7 @@ services:
       - 9090:9090
     volumes:
       - "./data/server:/data"
+
+networks:
+  label-studio:
+    external: true
