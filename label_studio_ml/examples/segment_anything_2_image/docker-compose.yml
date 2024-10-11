@@ -41,6 +41,13 @@ services:
       - "9090:9090"
     volumes:
       - "./data/server:/data"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia  # specify the driver for GPU
+              count: 1        # specify the number of GPUs
+              capabilities: [gpu]
 
 networks:
   label-studio:
