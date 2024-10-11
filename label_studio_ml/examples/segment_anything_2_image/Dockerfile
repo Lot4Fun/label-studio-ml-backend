@@ -38,7 +38,7 @@ RUN --mount=type=cache,target=${PIP_CACHE_DIR},sharing=locked \
     pip3 install -r requirements.txt
 
 # install segment-anything-2
-RUN cd / && git clone --depth 1 --branch main --single-branch https://github.com/facebookresearch/segment-anything-2.git
+RUN cd / && git clone --depth 1 --branch main --single-branch https://github.com/Lot4Fun/segment-anything-2.git:
 WORKDIR /segment-anything-2
 RUN --mount=type=cache,target=${PIP_CACHE_DIR},sharing=locked \
     pip3 install -e .
