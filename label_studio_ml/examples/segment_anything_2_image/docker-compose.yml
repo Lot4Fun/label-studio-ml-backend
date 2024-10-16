@@ -4,6 +4,7 @@ services:
   segment_anything_2_image:
     container_name: ml-backend
     image: humansignal/ml-backend:v0
+    restart: unless-stopped
     networks:
       - label-studio
     build:
