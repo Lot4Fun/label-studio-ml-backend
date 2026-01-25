@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   segment_anything_model:
     container_name: segment_anything_model
