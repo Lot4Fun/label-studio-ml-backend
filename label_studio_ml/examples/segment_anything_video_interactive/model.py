@@ -33,22 +33,33 @@ from label_studio_ml.model import LabelStudioMLBase
 from label_studio_ml.response import ModelResponse
 from label_studio_sdk.label_interface.objects import PredictionValue
 
+from control_detect import control_to_type, detect_control
 from frame_cache import FrameCache
+from frame_resolve import resolve_frame_index
+from ls_auth import ls_auth_headers, ls_token_for_sdk
+from url_auth import should_attach_ls_auth
 from mask_encoding import (
     mask_to_bbox_percent,
     mask_to_bitmap_png_base64,
     mask_to_polygons_percent,
 )
-from video_state import VideoRegistry
+from video_state import VideoRegistry, video_is_readable
 
 logger = logging.getLogger(__name__)
 
 DEVICE = os.getenv("DEVICE", "cuda")
 SEGMENT_ANYTHING_2_REPO_PATH = os.getenv("SEGMENT_ANYTHING_2_REPO_PATH", "segment-anything-2")
-MODEL_CONFIG = os.getenv("MODEL_CONFIG", "sam2_hiera_l.yaml")
-MODEL_CHECKPOINT = os.getenv("MODEL_CHECKPOINT", "sam2_hiera_large.pt")
+# SAM 2.1 by default — `download_ckpts.sh` now fetches only sam2.1_* weights,
+# and the matching configs live under the `configs/sam2.1/` Hydra group. Config
+# size must match the checkpoint size.
+MODEL_CONFIG = os.getenv("MODEL_CONFIG", "configs/sam2.1/sam2.1_hiera_l.yaml")
+MODEL_CHECKPOINT = os.getenv("MODEL_CHECKPOINT", "sam2.1_hiera_large.pt")
 WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "20"))
 MAX_FRAMES_TO_TRACK = int(os.getenv("MAX_FRAMES_TO_TRACK", "300"))
+
+# Schemes LS stores verbatim in task data for cloud-backed projects; kept in
+# sync with the SDK's own check in `label_studio_tools.core.utils.io`.
+CLOUD_URI_SCHEMES = ("s3://", "s3a://", "gs://", "azure-blob://")
 
 # How long a single `track_progress` call may hold the HTTP request waiting
 # for the *first* new frame before returning an empty batch. Long polling
@@ -70,6 +81,13 @@ TRACK_PROGRESS_BATCH_WINDOW_SECONDS = float(
     os.getenv("TRACK_PROGRESS_BATCH_WINDOW_SECONDS", "0.25")
 )
 TRACK_PROGRESS_MAX_BATCH = int(os.getenv("TRACK_PROGRESS_MAX_BATCH", "32"))
+
+# Label Studio's authenticated upload endpoints are not always reliable as
+# ffmpeg streaming inputs: local dev / nginx modes can return partial bodies,
+# and prewarm bursts can trigger 429s. Default to one authenticated download for
+# LS-hosted uploads, while still allowing explicit streaming for deployments
+# where range requests are known to work well.
+STREAM_LS_UPLOADS = os.getenv("LABEL_STUDIO_STREAM_LS_UPLOADS", "").lower() in {"1", "true", "yes", "on"}
 
 # Stop-tracking thresholds (see _run_tracking).
 # SAM2's mask decoder emits a per-frame object_score_logits; convention is
@@ -236,21 +254,15 @@ def _resolve_be_frame(context: Dict[str, Any], video) -> int:
     """Translate a frontend-supplied timestamp (ms) or 1-indexed frame into
     the BE's 0-indexed frame space using the video's own fps.
 
-    `time_ms` wins over `frame`: timestamps are fps-agnostic, while `frame`
-    carries the FE's config-fps assumption. If only `frame` is provided we
-    fall back to the legacy N-1 mapping (FE is 1-indexed).
+    Delegates to the dependency-free :func:`resolve_frame_index` so the
+    conversion can be unit-tested without torch/cv2 (see test_frame_resolve.py).
     """
-    raw_ms = context.get("time_ms")
-    if raw_ms is not None:
-        try:
-            ms = float(raw_ms)
-        except (TypeError, ValueError):
-            ms = None
-        if ms is not None and video.fps:
-            idx = int(round((ms / 1000.0) * video.fps))
-            max_idx = max(0, video.frame_count - 1)
-            return max(0, min(idx, max_idx))
-    return max(0, int(context.get("frame", 1)) - 1)
+    return resolve_frame_index(
+        context.get("time_ms"),
+        context.get("frame", 1),
+        video.fps,
+        video.frame_count,
+    )
 
 
 def _object_score(inference_state, obj_idx: int, frame_idx: int) -> Optional[float]:
@@ -308,44 +320,10 @@ def _extract_prompts(context: Dict[str, Any]) -> Dict[str, Any]:
             "box": np.array(box, dtype=np.float32) if box is not None else None}
 
 
-def _detect_control(label_interface) -> Tuple[str, str, str, str]:
-    """Return (from_name, to_name, object_type, control_type).
-
-    `object_type` ∈ {'Image', 'Video'}, `control_type` is the xml-lowercased
-    type we'll emit.
-    """
-    # Image control tags
-    for candidate in ("BitmaskLabels", "RectangleLabels",
-                      "PolygonLabels", "VectorLabels"):
-        try:
-            from_name, to_name, value = label_interface.get_first_tag_occurence(
-                candidate, "Image"
-            )
-            return from_name, to_name, "Image", _control_to_type(candidate)
-        except Exception:
-            pass
-    # Video control tags
-    for candidate, obj_tag in (
-        ("VideoVectorLabels", "Video"),
-        ("VideoRectangle", "Video"),
-    ):
-        try:
-            from_name, to_name, _ = label_interface.get_first_tag_occurence(candidate, obj_tag)
-            return from_name, to_name, "Video", _control_to_type(candidate)
-        except Exception:
-            pass
-    raise ValueError("no supported control tag found in label config")
-
-
-def _control_to_type(control: str) -> str:
-    return {
-        "BitmaskLabels": "bitmap",
-        "RectangleLabels": "rectanglelabels",
-        "PolygonLabels": "polygonlabels",
-        "VectorLabels": "vectorlabels",
-        "VideoRectangle": "videorectangle",
-        "VideoVectorLabels": "videovectorlabels",
-    }[control]
+# Control-tag detection lives in the dependency-free `control_detect` module so
+# it can be unit-tested without torch/cv2 (see test_control_detect.py).
+_detect_control = detect_control
+_control_to_type = control_to_type
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +545,7 @@ class SamVideoInteractive(LabelStudioMLBase):
                 ],
                 "model_info": {
                     "name": "SAM2",
-                    "version": os.getenv("MODEL_CHECKPOINT", "sam2_hiera_large.pt"),
+                    "version": MODEL_CHECKPOINT,
                 },
             },
         }])
@@ -593,7 +571,10 @@ class SamVideoInteractive(LabelStudioMLBase):
         image_url = self._image_url_from_task(task, to_name)
         ls_host, ls_token = self._ls_host_token()
         local_path = self.get_local_path(
-            image_url, task_id=task_id, ls_host=ls_host, ls_access_token=ls_token,
+            image_url,
+            task_id=task_id,
+            ls_host=ls_host,
+            ls_access_token=ls_token_for_sdk(ls_host, ls_token),
         )
 
         bgr = cv2.imread(local_path)
@@ -665,10 +646,7 @@ class SamVideoInteractive(LabelStudioMLBase):
             if cached is not None:
                 video = cached
             else:
-                ls_host, ls_token = self._ls_host_token()
-                local_path = self.get_local_path(
-                    raw_url, task_id=task_id, ls_host=ls_host, ls_access_token=ls_token,
-                )
+                local_path = self._download_valid_video(raw_url, task_id)
                 video = VIDEOS.get_or_create(task_id, local_path)
 
         # Prefer `time` (seconds) — the only quantity FE and BE can agree on
@@ -680,9 +658,19 @@ class SamVideoInteractive(LabelStudioMLBase):
 
         if event == "prewarm":
             frame_range = self._window_range(frame, window, direction, video.frame_count)
-            cached, pending = FRAME_CACHE.submit(
-                task_id, frame_range, lambda idx: self._encode_frame(task_id, idx)
-            )
+            # Fetch the whole window in ONE ffmpeg pass (one HTTP request to LS)
+            # rather than one request per frame, which trips LS's rate limit.
+            # The encode step pulls decoded frames from this buffer, falling
+            # back to a per-frame read only for any the prefetch missed.
+            prefetched = self._prefetch_window(video, frame_range)
+
+            def _encode(idx, _video=video, _frames=prefetched):
+                bgr = _frames.get(idx)
+                if bgr is None:
+                    bgr = _video.read_frame(idx)
+                return self._encode_bgr(bgr)
+
+            cached, pending = FRAME_CACHE.submit(task_id, frame_range, _encode)
             return PredictionValue(result=[{
                 "value": {"status": "ok", "cached": cached, "pending": pending,
                           "frame_count": video.frame_count},
@@ -744,32 +732,72 @@ class SamVideoInteractive(LabelStudioMLBase):
         return self._mask_response(mask, w, h, from_name, to_name)
 
     def _ls_host_token(self) -> Tuple[Optional[str], Optional[str]]:
-        """Return (ls_host, ls_token) using env vars first, then the cache
-        populated from `/setup`. Either may be None; callers pass them into
-        `self.get_local_path(ls_host=..., ls_access_token=...)` which lets
-        the SDK skip its `http://localhost:8000` default fallback.
+        """Return (ls_host, ls_token) for authenticated LS asset fetches.
 
-        LS's own `/setup` payload can carry `http://localhost:<port>` when
-        the LS side doesn't have `HOSTNAME` configured — that's useless to a
-        remote ML backend. The env-var-first ordering means an operator can
-        always override LS's guess via `.env` / `docker-compose`.
+        Host/token resolution is env first, then the cache populated from
+        `/setup`. Either may be None; callers pass them into
+        `self.get_local_path(ls_host=..., ls_access_token=...)` which lets the
+        SDK skip its `http://localhost:8000` default fallback.
+
+        LS's own `/setup` payload can carry `http://localhost:<port>` when the
+        LS side doesn't have `HOSTNAME` configured — that's useless to a remote
+        ML backend. Keep both host and token env-var-first so an operator can
+        fix credentials through the process environment / `docker-compose` and
+        restart the backend; otherwise an old `/setup` access token can shadow a
+        freshly configured `LABEL_STUDIO_API_KEY` and cause 401s on uploaded
+        files.
         """
-        env_host = (os.getenv("LABEL_STUDIO_URL") or "").rstrip("/")
-        env_token = os.getenv("LABEL_STUDIO_API_KEY") or ""
+        env_host = (os.getenv("LABEL_STUDIO_URL") or os.getenv("LABEL_STUDIO_HOST") or "").rstrip("/")
+        env_token = (
+            os.getenv("LABEL_STUDIO_API_KEY")
+            or os.getenv("LABEL_STUDIO_ACCESS_TOKEN")
+            or ""
+        )
         cached_host = (LS_CONTEXT.get("url") or "").rstrip("/")
         cached_token = LS_CONTEXT.get("token") or ""
         host = env_host or cached_host
         token = env_token or cached_token
         return (host or None, token or None)
 
+    def _download_valid_video(self, raw_url: str, task_id: str) -> str:
+        """Download via the LS SDK, but verify the file actually decodes.
+
+        `get_local_path` caches downloads by URL hash with no integrity check,
+        so a truncated download of a large video gets reused forever and the
+        decoder then dies with an opaque "failed to open video" (surfaced as a
+        503). On a bad cache hit, drop the file and re-download once.
+        """
+        ls_host, ls_token = self._ls_host_token()
+        sdk_token = ls_token_for_sdk(ls_host, ls_token)
+        for attempt in range(2):
+            local_path = self.get_local_path(
+                raw_url, task_id=task_id, ls_host=ls_host, ls_access_token=sdk_token,
+            )
+            ok, reason = video_is_readable(local_path)
+            if ok:
+                return local_path
+            logger.warning(
+                "cached video unreadable (attempt %d/2), re-downloading: %s — %s",
+                attempt + 1, local_path, reason,
+            )
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+        raise RuntimeError(
+            f"video failed to decode after re-download: {raw_url} ({reason})"
+        )
+
     def _resolve_video_source(self, raw_url: str, task_id: str):
         """Resolve a task video URL to a streamable source + auth headers.
 
-        * Cloud storage URLs (don't look like LS's own host) → stream directly,
-          no headers.
-        * LS-hosted URLs, whether absolute or relative → attach the LS API
-          token; LS guards the /data/upload/* path and returns 401 without it.
-        * No LS url / key configured → fall back to local download.
+        * External HTTP(S) URLs (don't look like LS's own host) → stream
+          directly, no headers.
+        * LS-hosted upload URLs / paths → authenticated local download by
+          default; direct ffmpeg streaming can be enabled with
+          `LABEL_STUDIO_STREAM_LS_UPLOADS=true` when the LS deployment supports
+          reliable range requests.
+        * Cloud-storage URIs → authenticated local download through the LS SDK.
 
         Resolution order for the LS hostname:
           1. `LABEL_STUDIO_URL` env var (explicit operator override)
@@ -781,26 +809,46 @@ class SamVideoInteractive(LabelStudioMLBase):
         ls_url = ls_url_opt or ""
         api_key = api_key_opt or ""
 
-        def _auth_headers():
-            return {"Authorization": f"Token {api_key}"} if api_key else None
-
-        def _points_at_ls(url: str) -> bool:
-            if not ls_url:
-                return False
-            return url.startswith(f"{ls_url}/") or url == ls_url
+        def _auth_headers(target_url: str):
+            # Reuses the LS SDK token/header handling for streaming ffmpeg
+            # requests, including refresh-JWT normalization.
+            return ls_auth_headers(ls_url, api_key, target_url=target_url)
 
         if raw_url.startswith("http://") or raw_url.startswith("https://"):
-            # Absolute URL — attach auth iff it's an LS-hosted URL.
-            return raw_url, _auth_headers() if _points_at_ls(raw_url) else None
+            # Absolute URL — attach auth iff its host matches the known LS host.
+            # Never attach to any other host: task data can carry external /
+            # presigned cloud URLs and we must not leak the LS token to them.
+            attach = should_attach_ls_auth(raw_url, ls_url, bool(api_key))
+            if attach and not STREAM_LS_UPLOADS:
+                logger.info(
+                    "LS-hosted video: downloading once instead of streaming (%s)",
+                    raw_url,
+                )
+                return self._download_valid_video(raw_url, task_id), None
+            return raw_url, _auth_headers(raw_url) if attach else None
 
-        if ls_url and api_key:
+        if raw_url.startswith(CLOUD_URI_SCHEMES):
+            # A cloud-storage URI is not a URL — only LS knows which storage it
+            # belongs to and holds the credentials, so it can't be streamed and
+            # must not be joined onto the LS host (that yields
+            # `https://<ls-host>/s3://bucket/…`, which 404s). The SDK resolves
+            # it through `/tasks/<id>/presign/` and downloads the result.
+            return self._download_valid_video(raw_url, task_id), None
+
+        if (
+            ls_url
+            and api_key
+            and STREAM_LS_UPLOADS
+            and raw_url.startswith(("/data/", "/upload", "data/", "upload"))
+        ):
             full_url = f"{ls_url}{raw_url}" if raw_url.startswith("/") else f"{ls_url}/{raw_url}"
-            return full_url, _auth_headers()
+            return full_url, _auth_headers(full_url)
 
-        logger.warning("streaming not available (no LABEL_STUDIO_URL), falling back to download")
-        local_path = self.get_local_path(
-            raw_url, task_id=task_id, ls_host=ls_url_opt, ls_access_token=api_key_opt,
-        )
+        if not ls_url:
+            logger.warning("streaming not available (no LABEL_STUDIO_URL), falling back to download")
+        else:
+            logger.info("video source requires Label Studio resolution; downloading once")
+        local_path = self._download_valid_video(raw_url, task_id)
         return local_path, None
 
     def _mask_response(self, mask, w, h, from_name, to_name):
@@ -905,6 +953,12 @@ class SamVideoInteractive(LabelStudioMLBase):
                 # as propagate_in_video walks through them — the wait for
                 # "encode all frames upfront" becomes "encode frame 0".
                 #
+                # MPS is the exception: SAM2's async JPEG loader can produce
+                # float64 CPU tensors and then move them to MPS before the
+                # subsequent `.float()` cast. MPS doesn't support float64, so
+                # load frames synchronously there; SAM2's sync path preallocates
+                # a float32 tensor and avoids the dtype hop.
+                #
                 # offload_video_to_cpu=True keeps the loaded frames on CPU so
                 # only the propagation thread touches the GPU. Without this
                 # the async loader pushes frames to the device with
@@ -914,7 +968,7 @@ class SamVideoInteractive(LabelStudioMLBase):
                 # mask "jumping" onto a different object.
                 inference_state = video_predictor.init_state(
                     video_path=frame_dir,
-                    async_loading_frames=True,
+                    async_loading_frames=(DEVICE != "mps"),
                     offload_video_to_cpu=True,
                 )
                 video_predictor.reset_state(inference_state)
@@ -1112,9 +1166,14 @@ class SamVideoInteractive(LabelStudioMLBase):
         video = VIDEOS._handles.get(task_id)
         if video is None:
             raise RuntimeError(f"no video handle for task {task_id}")
-        frame_bgr = video.read_frame(frame_idx)
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        return self._encode_bgr(video.read_frame(frame_idx))
 
+    def _encode_bgr(self, frame_bgr):
+        """Encode an already-decoded BGR frame into a SAM2 image embedding.
+        Split out from `_encode_frame` so prewarm can fetch a whole window in
+        one ffmpeg pass (one HTTP request) and feed the frames in here, instead
+        of one network read per frame (which trips LS rate limits)."""
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         image_predictor = make_image_predictor()
         image_predictor.set_image(rgb)
         return {
@@ -1122,6 +1181,25 @@ class SamVideoInteractive(LabelStudioMLBase):
             "original_size": image_predictor._orig_hw,
             "is_image_set": True,
         }
+
+    def _prefetch_window(self, video, frame_range: List[int]) -> Dict[int, Any]:
+        """Fetch a contiguous frame window in a single ffmpeg pass to collapse
+        one-HTTP-request-per-frame into one request for the whole window.
+
+        Best-effort: returns {frame_idx: bgr_frame}; on any failure returns the
+        frames it managed to get (possibly empty) and the encode step falls back
+        to per-frame reads for the rest.
+        """
+        if not frame_range:
+            return {}
+        start = min(frame_range)
+        count = max(frame_range) - start + 1
+        try:
+            frames = video.read_frame_range(start, count)
+        except Exception as e:
+            logger.warning("window prefetch failed (%s); falling back to per-frame", e)
+            return {}
+        return {start + i: f for i, f in enumerate(frames)}
 
     def _window_range(self, frame: int, window: int, direction: str, frame_count: int):
         if direction == "backward":

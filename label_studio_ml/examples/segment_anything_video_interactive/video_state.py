@@ -11,8 +11,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -21,6 +23,47 @@ import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Streaming frames from LS issues one HTTP request per ffmpeg/ffprobe call.
+# Under a prewarm burst that can trip LS's rate limit (HTTP 429). ffmpeg
+# doesn't surface `Retry-After`, so we detect the 429 in its stderr and retry
+# with exponential backoff + jitter.
+_FETCH_RETRY_ATTEMPTS = int(os.getenv("LS_FETCH_RETRY_ATTEMPTS", "4"))
+_FETCH_RETRY_BASE_DELAY = float(os.getenv("LS_FETCH_RETRY_BASE_DELAY", "1.0"))
+_FETCH_RETRY_MAX_DELAY = float(os.getenv("LS_FETCH_RETRY_MAX_DELAY", "30.0"))
+
+
+def _is_rate_limited(stderr) -> bool:
+    """True if ffmpeg/ffprobe stderr indicates an HTTP 429 from the server."""
+    if stderr is None:
+        return False
+    text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else str(stderr)
+    text = text.lower()
+    return "429" in text or "too many requests" in text
+
+
+def _run_with_429_backoff(cmd: List[str], *, timeout: int, text: bool = False):
+    """Run an ffmpeg/ffprobe command, retrying on HTTP 429 with exponential
+    backoff + jitter. Returns the final CompletedProcess (success, a
+    non-retryable failure, or the last 429 after exhausting attempts) — the
+    caller inspects returncode as before."""
+    result = None
+    for attempt in range(_FETCH_RETRY_ATTEMPTS):
+        result = subprocess.run(cmd, capture_output=True, text=text, timeout=timeout)
+        if result.returncode == 0 or not _is_rate_limited(result.stderr):
+            return result
+        if attempt == _FETCH_RETRY_ATTEMPTS - 1:
+            break
+        delay = min(
+            _FETCH_RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5),
+            _FETCH_RETRY_MAX_DELAY,
+        )
+        logger.warning(
+            "LS rate-limited (HTTP 429); backing off %.1fs (attempt %d/%d)",
+            delay, attempt + 1, _FETCH_RETRY_ATTEMPTS,
+        )
+        time.sleep(delay)
+    return result
 
 
 def _validate_probe_source(source: str) -> str:
@@ -57,7 +100,7 @@ def _probe_video(source: str, headers: Optional[Dict[str, str]] = None) -> dict:
     cmd.extend(["--", source])
     source_kind = "url" if source.startswith("http://") or source.startswith("https://") else "local"
     logger.info("ffprobe started (source_kind=%s)", source_kind)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    result = _run_with_429_backoff(cmd, timeout=30, text=True)
     if result.returncode != 0:
         logger.error("ffprobe failed: returncode=%s stderr=%s stdout=%s",
                       result.returncode, result.stderr[:500], result.stdout[:200])
@@ -66,6 +109,29 @@ def _probe_video(source: str, headers: Optional[Dict[str, str]] = None) -> dict:
         logger.error("ffprobe returned empty output (source_kind=%s)", source_kind)
         raise RuntimeError(f"ffprobe returned empty output (source_kind={source_kind})")
     return json.loads(result.stdout)
+
+
+def video_is_readable(path: str) -> Tuple[bool, str]:
+    """Can a downloaded video file actually be decoded? Returns (ok, reason).
+
+    ffprobe rather than cv2 because its error says *why*: a download truncated
+    by LS's storage proxy fails with "moov atom not found", which cv2 reports
+    exactly the same way as a codec its build doesn't support. Falls back to
+    cv2 when ffprobe isn't installed.
+    """
+    if not os.path.exists(path):
+        return False, "file does not exist"
+    size = os.path.getsize(path)
+    try:
+        _parse_probe(_probe_video(path))
+        return True, ""
+    except FileNotFoundError:  # no ffprobe on PATH
+        cap = cv2.VideoCapture(path)
+        ok = cap.isOpened() and cap.read()[0]
+        cap.release()
+        return (True, "") if ok else (False, f"cv2 could not decode it ({size} bytes)")
+    except Exception as e:
+        return False, f"{e} ({size} bytes)"
 
 
 def _parse_probe(info: dict) -> Tuple[int, int, int, float]:
@@ -153,7 +219,7 @@ class VideoHandle:
                "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "bgr24",
                "pipe:1"]
         )
-        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        result = _run_with_429_backoff(cmd, timeout=30)
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg frame read failed: {result.stderr[:300]}")
         expected = self.width * self.height * 3
@@ -174,7 +240,7 @@ class VideoHandle:
                "-frames:v", str(count), "-f", "rawvideo", "-pix_fmt", "bgr24",
                "pipe:1"]
         )
-        result = subprocess.run(cmd, capture_output=True, timeout=120)
+        result = _run_with_429_backoff(cmd, timeout=120)
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg range read failed: {result.stderr[:300]}")
         frame_bytes = self.width * self.height * 3
@@ -221,7 +287,7 @@ class VideoHandle:
                "-frames:v", str(count), "-q:v", "2",
                "-start_number", "0", pattern]
         )
-        result = subprocess.run(cmd, capture_output=True, timeout=120)
+        result = _run_with_429_backoff(cmd, timeout=120)
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg JPEG extraction failed: {result.stderr[:300]}")
         written = len([f for f in os.listdir(output_dir) if f.endswith(".jpg")])
